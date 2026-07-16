@@ -18,6 +18,9 @@ feetech = "solarian_feetech.actuator:FeetechServo"
 [project.entry-points."solarian.actuator_buses"]
 feetech = "solarian_feetech.bus:FeetechBus"
 
+[project.entry-points."solarian.commands"]
+feetech-set-id = "solarian_feetech.commands.set_id:SetIdCommand"
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"

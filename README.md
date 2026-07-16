@@ -43,7 +43,6 @@ The `FeetechBus` is automatically used for communication - no configuration need
 
 - Solarian framework (>=0.1.0)
 - feetech-servo-sdk (>=1.0.0)
-- lerobot (>=0.1.0)
 
 ## Repository
 

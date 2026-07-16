@@ -1,0 +1,332 @@
+"""``solarian feetech-set-id`` — interactively assign IDs to Feetech motors.
+
+Fresh Feetech servos all ship with the same ID (1) and therefore collide on a
+shared bus, which makes them impossible to address individually.  This command
+lets you provision a daisy chain *without unplugging* anything:
+
+1. Scan the bus across every supported baud-rate and list the motors found.
+2. Pick a target motor (by default the one still at the factory ID ``1`` — i.e.
+   the motor you just added to the chain).
+3. Apply recommended comms settings (``Return_Delay_Time = 0``) to it.
+4. Optionally write a new ID to it.
+5. Repeat for the next motor.
+
+Because ``Return_Delay_Time`` is applied to whichever motor you select, you can
+also re-run this command purely to fix the comms settings on already-configured
+motors (just decline the ID change).
+
+Because every already-configured motor has a unique, non-default ID, the newly
+added motor is always the only one still at ID 1 — so it can be identified by
+its default ID and reassigned safely while the rest of the chain stays
+connected (no motion required).
+"""
+
+import argparse
+import sys
+
+import serial.tools.list_ports
+
+from solarian.cli import BaseCommand, CommandRegistry
+
+from ..lerobot.feetech import FeetechMotorsBus
+from ..lerobot.motors_bus import get_address
+from ..lerobot.feetech.tables import (
+    MODEL_BAUDRATE_TABLE,
+    MODEL_NUMBER_TABLE,
+)
+
+#: model number (reported by the motor) -> model name understood by the SDK
+_MODEL_NB_TO_NAME = {nb: name for name, nb in MODEL_NUMBER_TABLE.items()}
+
+
+@CommandRegistry.register("feetech-set-id")
+class SetIdCommand(BaseCommand):
+    help = "Scan a Feetech bus, apply recommended comms settings, and assign a motor ID."
+
+    def handle(self, cfg) -> None:
+        args = self._parse_args()
+
+        port = args.port or self._prompt_for_port()
+        if port is None:
+            print("No port selected. Aborting.")
+            return
+
+        # A single bus with no declared motors is enough for scanning and for
+        # the low-level (by-ID) reads/writes we perform below.
+        bus = FeetechMotorsBus(port, {})
+        bus._connect(handshake=False)
+        try:
+            while True:
+                found = self._scan(bus, only_baudrate=args.baudrate)
+                if not found:
+                    print(
+                        "\nNo motors responded on this port.\n"
+                        "  - Check power and the data cable.\n"
+                        "  - If several brand-new motors are chained together they all share\n"
+                        "    ID 1 and collide; connect only one new motor at a time.\n"
+                    )
+                    if not self._ask_yes_no("Scan again?", default=True):
+                        break
+                    continue
+
+                self._print_found(found)
+                target = self._select_target(found)
+                if target is None:
+                    break
+
+                baudrate, motor_id, model_nb = target
+                model = _MODEL_NB_TO_NAME.get(model_nb)
+                if model is None:
+                    print(
+                        f"Motor at ID {motor_id} reports unknown model number {model_nb}; "
+                        "cannot configure it."
+                    )
+                    if not self._ask_yes_no("Set up another motor?", default=True):
+                        break
+                    continue
+
+                # Always apply the recommended comms settings (Return_Delay_Time=0)
+                # to the selected motor. This is written to EPROM so it persists,
+                # and it keeps multi-motor grouped sync reads reliable.
+                self._apply_comms_config(bus, baudrate, motor_id, model)
+
+                if self._ask_yes_no(
+                    f"Change this motor's ID? (currently ID {motor_id}, {model})",
+                    default=(motor_id == 1),
+                ):
+                    target_id = self._prompt_for_id(current_id=motor_id)
+                    if target_id is not None:
+                        self._write_id_and_baudrate(bus, model, baudrate, motor_id, target_id)
+                        self._verify(bus, target_id, model)
+
+                if not self._ask_yes_no("Set up another motor?", default=True):
+                    break
+        finally:
+            try:
+                bus.port_handler.closePort()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+
+        print("\nDone.")
+
+    # ------------------------------------------------------------------ args
+
+    def _parse_args(self) -> argparse.Namespace:
+        parser = argparse.ArgumentParser(prog="solarian feetech-set-id", add_help=False)
+        parser.add_argument(
+            "--port",
+            default=None,
+            help="Serial port of the bus (e.g. /dev/ttyUSB0). Prompted if omitted.",
+        )
+        parser.add_argument(
+            "--baudrate",
+            type=int,
+            default=None,
+            help="Only scan this baud-rate (faster). Otherwise all rates are scanned.",
+        )
+        # Ignore the global CLI flags (--conf/--settings) and anything else.
+        args, _ = parser.parse_known_args(sys.argv[2:])
+        return args
+
+    def _prompt_for_port(self) -> str | None:
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            print("No serial ports detected.")
+            return None
+
+        print("\n=== Available Ports ===")
+        for idx, p in enumerate(ports, 1):
+            print(f"{idx}. {p.device} ({p.description})")
+
+        raw = input(f"Select a port (1-{len(ports)}), or type a path: ").strip()
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(ports):
+                return ports[idx - 1].device
+            print("Invalid selection.")
+            return None
+        return raw or None
+
+    # --------------------------------------------------------------- scanning
+
+    #: Highest motor ID probed during the unicast sweep. Kept small because each
+    #: missing ID costs a full packet timeout (~50 ms); robot chains use low IDs.
+    _SWEEP_MAX_ID = 30
+
+    def _baudrates_to_scan(self, bus: FeetechMotorsBus, only_baudrate: int | None) -> list[int]:
+        if only_baudrate:
+            return [only_baudrate]
+        # Try the default (by far most common) baud-rate first so the usual case
+        # finishes in one pass instead of walking all 11 rates.
+        rest = [b for b in bus.available_baudrates if b != bus.default_baudrate]
+        return [bus.default_baudrate, *rest]
+
+    def _scan(self, bus: FeetechMotorsBus, only_baudrate: int | None = None):
+        """Return ``{baudrate: {id: model_number}}`` for responding motors.
+
+        A broadcast ping is fast but can silently miss motors whose
+        ``Return_Delay_Time`` is large (the factory default), so we confirm with
+        a short per-ID unicast sweep on the active baud-rate. Motors always share
+        a single baud-rate, so we stop at the first rate that responds.
+        """
+        baudrates = self._baudrates_to_scan(bus, only_baudrate)
+        print("\nScanning bus...")
+        found: dict[int, dict[int, int]] = {}
+        for baudrate in baudrates:
+            bus.set_baudrate(baudrate)
+            motors = dict(bus.broadcast_ping(num_retry=1) or {})
+            if motors:
+                # Catch any motors the broadcast missed, then stop: the whole
+                # chain lives on this one baud-rate.
+                motors.update(self._unicast_sweep(bus, skip=set(motors)))
+                found[baudrate] = motors
+                break
+
+        # Fallback: nothing answered a broadcast anywhere. Do a per-ID sweep on
+        # each rate (still bounded to the low ID range) until something responds.
+        if not found:
+            print("Broadcast ping found nothing; falling back to per-ID scan...")
+            for baudrate in baudrates:
+                bus.set_baudrate(baudrate)
+                motors = self._unicast_sweep(bus, skip=set())
+                if motors:
+                    found[baudrate] = motors
+                    break
+
+        return found
+
+    def _unicast_sweep(self, bus: FeetechMotorsBus, skip: set[int]) -> dict[int, int]:
+        """Ping IDs individually (low range only) and return ``{id: model_number}``."""
+        motors: dict[int, int] = {}
+        for motor_id in range(self._SWEEP_MAX_ID + 1):
+            if motor_id in skip:
+                continue
+            model_nb = bus.ping(motor_id)
+            if model_nb is not None:
+                motors[motor_id] = model_nb
+        return motors
+
+    def _print_found(self, found: dict[int, dict[int, int]]) -> None:
+        print("\n=== Motors Found ===")
+        for baudrate in sorted(found):
+            for motor_id in sorted(found[baudrate]):
+                model_nb = found[baudrate][motor_id]
+                model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+                print(f"  baudrate={baudrate:>8}  id={motor_id:<3}  model={model}")
+
+    def _select_target(self, found: dict[int, dict[int, int]]):
+        """Pick a motor to configure.
+
+        Returns a ``(baudrate, id, model_number)`` tuple, or ``None`` to stop.
+        """
+        # Flatten to a stable, ordered list of candidates.
+        candidates: list[tuple[int, int, int]] = []
+        for baudrate in sorted(found):
+            for motor_id in sorted(found[baudrate]):
+                candidates.append((baudrate, motor_id, found[baudrate][motor_id]))
+
+        # Default target: the (single) motor still at the factory ID 1.
+        id1 = [c for c in candidates if c[1] == 1]
+        if len(id1) == 1:
+            baudrate, motor_id, model_nb = id1[0]
+            model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+            if self._ask_yes_no(
+                f"Target the newly-added motor at ID 1 (baudrate={baudrate}, {model})?",
+                default=True,
+            ):
+                return id1[0]
+        elif len(id1) > 1:
+            print(
+                "\nWarning: multiple motors answered at ID 1. They cannot be told\n"
+                "apart on a shared bus — connect only ONE new (ID 1) motor at a time."
+            )
+
+        print("\n=== Select Motor ===")
+        for idx, (baudrate, motor_id, model_nb) in enumerate(candidates, 1):
+            model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+            print(f"{idx}. baudrate={baudrate} id={motor_id} model={model}")
+        raw = input(f"Motor number (1-{len(candidates)}), or Enter to stop: ").strip()
+        if not raw:
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+            return candidates[int(raw) - 1]
+        print("Invalid selection.")
+        return None
+
+    # --------------------------------------------------------------- writing
+
+    def _apply_comms_config(self, bus: FeetechMotorsBus, baudrate: int, motor_id: int, model: str) -> None:
+        """Write recommended communication settings to a motor.
+
+        Sets ``Return_Delay_Time`` to 0 (the factory default is ~500 us, which
+        adds latency and makes multi-motor grouped sync reads collide). Torque
+        is disabled first so the EPROM lock is cleared and the write persists.
+        """
+        bus.set_baudrate(baudrate)
+        bus._disable_torque(motor_id, model)
+        addr, length = get_address(bus.model_ctrl_table, model, "Return_Delay_Time")
+        bus._write(addr, length, motor_id, 0, raise_on_error=True)
+        print("  Set Return_Delay_Time -> 0")
+
+    def _write_id_and_baudrate(
+        self,
+        bus: FeetechMotorsBus,
+        model: str,
+        current_baudrate: int,
+        current_id: int,
+        target_id: int,
+        target_baudrate: int | None = None,
+    ) -> None:
+        target_baudrate = target_baudrate or bus.default_baudrate
+
+        bus.set_baudrate(current_baudrate)
+        bus._disable_torque(current_id, model)
+
+        # Write the new ID (addressed at the *current* ID).
+        id_addr, id_len = get_address(bus.model_ctrl_table, model, "ID")
+        bus._write(id_addr, id_len, current_id, target_id, raise_on_error=True)
+        print(f"  Wrote ID {current_id} -> {target_id}")
+
+        # Write the new baud-rate (now addressed at the *new* ID).
+        baud_addr, baud_len = get_address(bus.model_ctrl_table, model, "Baud_Rate")
+        baud_index = MODEL_BAUDRATE_TABLE[model][target_baudrate]
+        bus._write(baud_addr, baud_len, target_id, baud_index, raise_on_error=True)
+        print(f"  Set baud-rate -> {target_baudrate}")
+
+        bus.set_baudrate(target_baudrate)
+
+    def _verify(self, bus: FeetechMotorsBus, target_id: int, model: str) -> None:
+        model_nb = bus.ping(target_id)
+        expected = MODEL_NUMBER_TABLE.get(model)
+        if model_nb == expected:
+            print(f"  Verified: motor now responds at ID {target_id}.")
+        else:
+            print(
+                f"  Warning: could not verify motor at ID {target_id} "
+                f"(ping returned {model_nb!r})."
+            )
+
+    # ---------------------------------------------------------------- helpers
+
+    def _prompt_for_id(self, current_id: int) -> int | None:
+        raw = input("New ID (1-253), or Enter to cancel: ").strip()
+        if not raw:
+            return None
+        if not raw.isdigit():
+            print("ID must be a number.")
+            return None
+        new_id = int(raw)
+        if not (1 <= new_id <= 253):
+            print("ID must be between 1 and 253.")
+            return None
+        if new_id == current_id:
+            print(f"Motor already has ID {new_id}; nothing to do.")
+            return None
+        return new_id
+
+    def _ask_yes_no(self, prompt: str, default: bool = True) -> bool:
+        suffix = "[Y/n]" if default else "[y/N]"
+        raw = input(f"{prompt} {suffix} ").strip().lower()
+        if not raw:
+            return default
+        return raw in ("y", "yes")

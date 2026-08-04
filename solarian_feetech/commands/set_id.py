@@ -9,7 +9,9 @@ lets you provision a daisy chain *without unplugging* anything:
    the motor you just added to the chain).
 3. Apply recommended comms settings (``Return_Delay_Time = 0``) to it.
 4. Optionally write a new ID to it.
-5. Repeat for the next motor.
+5. Optionally drive the shaft to mid-encoder so you can mount the horn at the
+   mechanism's mid-travel (keeps later joint travel away from the 0/CPR wrap).
+6. Repeat for the next motor.
 
 Because ``Return_Delay_Time`` is applied to whichever motor you select, you can
 also re-run this command purely to fix the comms settings on already-configured
@@ -23,16 +25,20 @@ connected (no motion required).
 
 import argparse
 import sys
+import time
 
 import serial.tools.list_ports
 
 from solarian.cli import BaseCommand, CommandRegistry
 
-from ..lerobot.feetech import FeetechMotorsBus
+from ..lerobot.common.utils.encoding_utils import decode_sign_magnitude, encode_sign_magnitude
+from ..lerobot.feetech import FeetechMotorsBus, OperatingMode, TorqueMode
 from ..lerobot.motors_bus import get_address
 from ..lerobot.feetech.tables import (
     MODEL_BAUDRATE_TABLE,
+    MODEL_ENCODING_TABLE,
     MODEL_NUMBER_TABLE,
+    MODEL_RESOLUTION,
 )
 
 #: model number (reported by the motor) -> model name understood by the SDK
@@ -90,6 +96,7 @@ class SetIdCommand(BaseCommand):
                 # and it keeps multi-motor grouped sync reads reliable.
                 self._apply_comms_config(bus, baudrate, motor_id, model)
 
+                active_id = motor_id
                 if self._ask_yes_no(
                     f"Change this motor's ID? (currently ID {motor_id}, {model})",
                     default=(motor_id == 1),
@@ -98,6 +105,19 @@ class SetIdCommand(BaseCommand):
                     if target_id is not None:
                         self._write_id_and_baudrate(bus, model, baudrate, motor_id, target_id)
                         self._verify(bus, target_id, model)
+                        active_id = target_id
+
+                half = (MODEL_RESOLUTION[model] - 1) // 2
+                if self._ask_yes_no(
+                    f"Drive shaft to mid-encoder ({half}) for horn mounting?\n"
+                    "  WARNING: Only if the output is free to rotate (no linkage / hard stops).",
+                    default=True,
+                ):
+                    try:
+                        self._move_to_mid_encoder(bus, baudrate, active_id, model)
+                    except Exception as exc:  # noqa: BLE001 - keep provisioning loop alive
+                        print(f"  Mid-encoder move failed: {exc}")
+                        print("  Torque disabled; you can retry or mount manually.")
 
                 if not self._ask_yes_no("Set up another motor?", default=True):
                     break
@@ -305,6 +325,96 @@ class SetIdCommand(BaseCommand):
                 f"  Warning: could not verify motor at ID {target_id} "
                 f"(ping returned {model_nb!r})."
             )
+
+    def _move_to_mid_encoder(
+        self,
+        bus: FeetechMotorsBus,
+        baudrate: int,
+        motor_id: int,
+        model: str,
+        *,
+        settle_s: float = 3.0,
+        tol: int = 8,
+    ) -> None:
+        """Drive Present/Actual to mid-encoder and leave torque off.
+
+        Clears ``Homing_Offset`` and opens position limits so Goal mid means
+        Absolute mid. Intended for bare / free shafts before horn mounting —
+        do not use against a hard-stop linkage.
+        """
+        resolution = MODEL_RESOLUTION[model]
+        half = (resolution - 1) // 2
+        bus.set_baudrate(baudrate)
+        bus._disable_torque(motor_id, model)
+
+        self._write_reg(bus, model, motor_id, "Homing_Offset", 0)
+        self._write_reg(bus, model, motor_id, "Min_Position_Limit", 0)
+        self._write_reg(bus, model, motor_id, "Max_Position_Limit", resolution - 1)
+        if "Operating_Mode" in bus.model_ctrl_table.get(model, {}):
+            self._write_reg(bus, model, motor_id, "Operating_Mode", OperatingMode.POSITION.value)
+        self._ensure_single_turn_feedback(bus, model, motor_id)
+
+        present_before = self._read_reg(bus, model, motor_id, "Present_Position")
+        print(f"  Present before: {present_before}  →  commanding Goal {half}")
+
+        self._enable_torque(bus, motor_id, model)
+        try:
+            self._write_reg(bus, model, motor_id, "Goal_Position", half)
+            deadline = time.monotonic() + settle_s
+            present = present_before
+            while time.monotonic() < deadline:
+                present = self._read_reg(bus, model, motor_id, "Present_Position")
+                if abs(present - half) <= tol:
+                    break
+                time.sleep(0.05)
+        finally:
+            bus._disable_torque(motor_id, model)
+
+        present = self._read_reg(bus, model, motor_id, "Present_Position")
+        if abs(present - half) <= tol:
+            print(f"  Mid-encoder reached (Present={present}). Mount the horn at mid-travel, then calibrate.")
+        else:
+            print(
+                f"  Present={present} (wanted ~{half}). Shaft may be blocked — "
+                "check free rotation and retry."
+            )
+
+    def _ensure_single_turn_feedback(
+        self, bus: FeetechMotorsBus, model: str, motor_id: int
+    ) -> None:
+        """Clear Phase bit 4 on STS3215 so feedback stays in [0, resolution)."""
+        if model != "sts3215":
+            return
+        if "Phase" not in bus.model_ctrl_table.get(model, {}):
+            return
+        phase = self._read_reg(bus, model, motor_id, "Phase")
+        if phase & 0x10:
+            self._write_reg(bus, model, motor_id, "Phase", phase & ~0x10)
+            print("  Cleared Phase bit 4 (single-turn feedback)")
+
+    def _enable_torque(self, bus: FeetechMotorsBus, motor_id: int, model: str) -> None:
+        addr, length = get_address(bus.model_ctrl_table, model, "Torque_Enable")
+        bus._write(addr, length, motor_id, TorqueMode.ENABLED.value, raise_on_error=True)
+        addr, length = get_address(bus.model_ctrl_table, model, "Lock")
+        bus._write(addr, length, motor_id, 1, raise_on_error=True)
+
+    def _write_reg(
+        self, bus: FeetechMotorsBus, model: str, motor_id: int, data_name: str, value: int
+    ) -> None:
+        addr, length = get_address(bus.model_ctrl_table, model, data_name)
+        encoded = value
+        sign_bit = MODEL_ENCODING_TABLE.get(model, {}).get(data_name)
+        if sign_bit is not None:
+            encoded = encode_sign_magnitude(value, sign_bit)
+        bus._write(addr, length, motor_id, encoded, raise_on_error=True)
+
+    def _read_reg(self, bus: FeetechMotorsBus, model: str, motor_id: int, data_name: str) -> int:
+        addr, length = get_address(bus.model_ctrl_table, model, data_name)
+        raw, _, _ = bus._read(addr, length, motor_id, raise_on_error=True)
+        sign_bit = MODEL_ENCODING_TABLE.get(model, {}).get(data_name)
+        if sign_bit is not None:
+            return decode_sign_magnitude(raw, sign_bit)
+        return raw
 
     # ---------------------------------------------------------------- helpers
 

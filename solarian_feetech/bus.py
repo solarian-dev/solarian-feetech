@@ -65,11 +65,29 @@ def map_motor_mode(mode: str):
 
 
 #: Feetech grouped sync reads get corrupted ("Incorrect status packet" / "no
-#: status packet") when motors of different models share one frame, even though
-#: each model reads fine on its own. We therefore split reads into per-model
-#: chunks; this cap additionally bounds the chunk size for very large same-model
-#: chains.
+#: status packet") when motors that don't share the same response timing sit in
+#: one frame, even though each reads fine on its own. In practice this happens
+#: for mixed *models* and also for the same model running mixed *firmware* (e.g.
+#: 3.9 vs 3.10), whose status-packet timing differs enough to collide. We
+#: therefore split reads into per-(model, firmware) chunks; this cap
+#: additionally bounds the chunk size for very large homogeneous chains.
 SYNC_READ_MAX_GROUP = 7
+
+
+def _firmware_by_name(bus: FeetechMotorsBus) -> Dict[str, str | None]:
+    """Return ``{motor_name: firmware_version}`` read once and cached on *bus*.
+
+    Firmware version is a read-only EEPROM field, so it is read a single time
+    (the first grouped read after connect) and memoized; subsequent calls are
+    free. Motors whose firmware can't be read map to ``None`` and are grouped by
+    model alone.
+    """
+    cache = getattr(bus, "_firmware_version_cache", None)
+    if cache is None:
+        by_id = bus._read_firmware_version([bus.motors[n].id for n in bus.motors])
+        cache = {name: by_id.get(bus.motors[name].id) for name in bus.motors}
+        bus._firmware_version_cache = cache
+    return cache
 
 
 def chunk_by_model(
@@ -77,15 +95,18 @@ def chunk_by_model(
 ) -> list[list[str]]:
     """Split motors into groups that sync-read reliably.
 
-    Motors are grouped by model (a single frame spanning mixed models drops
-    packets) and each group is capped at ``max_group`` motors.
+    Motors are grouped by ``(model, firmware version)`` -- a single frame
+    spanning mixed models *or* mixed firmware drops packets -- and each group is
+    capped at ``max_group`` motors.
     """
-    by_model: Dict[str, list[str]] = {}
+    firmware = _firmware_by_name(bus)
+    by_key: Dict[tuple[str, str | None], list[str]] = {}
     for name in motor_names:
-        by_model.setdefault(bus.motors[name].model, []).append(name)
+        key = (bus.motors[name].model, firmware.get(name))
+        by_key.setdefault(key, []).append(name)
 
     groups: list[list[str]] = []
-    for names in by_model.values():
+    for names in by_key.values():
         for i in range(0, len(names), max_group):
             groups.append(names[i : i + max_group])
     return groups
@@ -173,6 +194,31 @@ class FeetechBus(ActuatorBus):
             if not normalize or data_name not in NORMALIZED_DATA:
                 class_values = {k: int(v) for k, v in class_values.items()}
             self.bus.sync_write(data_name, values=class_values, normalize=normalize)
+
+    def counts_per_revolution(self, name: str) -> int | None:
+        """Encoder resolution (counts/rev) for motor ``name`` from its model.
+
+        Powers the servo-agnostic IK-alignment angular hook: Feetech STS/SMS
+        servos are 4096 counts/rev per :data:`MODEL_RESOLUTION`.
+        """
+        try:
+            model = self.bus.motors[name].model
+            return int(self.bus.model_resolution_table[model])
+        except Exception:
+            return None
+
+    def max_homing_offset_abs(self, name: str) -> int | None:
+        """Max ``|Homing_Offset|`` for Feetech STS/SMS (sign bit 11 → ±2047)."""
+        from .lerobot.feetech.tables import MODEL_ENCODING_TABLE
+
+        try:
+            model = self.bus.motors[name].model
+            sign_bit = MODEL_ENCODING_TABLE.get(model, {}).get("Homing_Offset")
+            if sign_bit is None:
+                return None
+            return (1 << int(sign_bit)) - 1
+        except Exception:
+            return None
 
     def is_calibrated(self) -> bool:
         return self.bus.is_calibrated

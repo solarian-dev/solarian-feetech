@@ -5,7 +5,7 @@ Actuator class for Feetech motors (e.g., STS3215, SCS series).
 """
 
 from solarian.core.servo import Servo
-from solarian.core.data import PosData, SpeedData
+from solarian.core.data import PosData, SpeedData, TemperatureData
 
 from solarian_feetech.bus import FeetechBus
 
@@ -30,5 +30,6 @@ class FeetechServo(Servo):
 
     pos = PosData()
     speed = SpeedData()
+    temperature = TemperatureData()
     
     

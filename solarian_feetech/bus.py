@@ -7,7 +7,7 @@ Bus implementation for communicating with Feetech servos.
 import logging
 from typing import Dict, Any
 
-from solarian.core.data import PosData, SpeedData, TorqueEnableData, Data
+from solarian.core.data import PosData, SpeedData, TorqueEnableData, Data, TemperatureData
 from .lerobot.feetech import FeetechMotorsBus
 from .lerobot.feetech.feetech import NORMALIZED_DATA
 from solarian.core.calibration import Motor, MotorCalibration, MotorNormMode
@@ -39,6 +39,7 @@ WRITE_MAP = {
 READ_MAP = {
     PosData: "Present_Position",
     SpeedData: "Present_Velocity",
+    TemperatureData: "Present_Temperature",
 }
 
 def map_write(data_type: type[Data]):

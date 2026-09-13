@@ -20,13 +20,15 @@ class FeetechServo(Servo):
         FeetechServo = actuators.get("feetech")
         
         class MyArmModule(Module):
-            shoulder: FeetechServo = FeetechServo(id=1, model="sts3215")
-            elbow: FeetechServo = FeetechServo(id=2, model="sts3215")
+            shoulder = FeetechServo(model="sts3215")
+            wrist_roll = FeetechServo(model="sts3215", is_continuous=True)
     
     The corresponding FeetechBus will be automatically used for communication.
+    Servo id and port stay in the module yaml (deployment).
     """
     
     bus_class = FeetechBus
+    default_mode = "range_m100_100"
 
     pos = PosData()
     speed = SpeedData()

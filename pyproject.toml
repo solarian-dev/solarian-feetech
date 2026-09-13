@@ -20,6 +20,7 @@ feetech = "solarian_feetech.bus:FeetechBus"
 
 [project.entry-points."solarian.commands"]
 feetech-set-id = "solarian_feetech.commands.set_id:SetIdCommand"
+feetech-inspect = "solarian_feetech.commands.inspect:InspectCommand"
 
 [build-system]
 requires = ["setuptools>=61.0"]

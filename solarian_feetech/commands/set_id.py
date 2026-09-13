@@ -27,8 +27,6 @@ import argparse
 import sys
 import time
 
-import serial.tools.list_ports
-
 from solarian.cli import BaseCommand, CommandRegistry
 
 from ..lerobot.common.utils.encoding_utils import decode_sign_magnitude, encode_sign_magnitude
@@ -40,9 +38,7 @@ from ..lerobot.feetech.tables import (
     MODEL_NUMBER_TABLE,
     MODEL_RESOLUTION,
 )
-
-#: model number (reported by the motor) -> model name understood by the SDK
-_MODEL_NB_TO_NAME = {nb: name for name, nb in MODEL_NUMBER_TABLE.items()}
+from ..scan import MODEL_NB_TO_NAME, prompt_for_port, scan_motors
 
 
 @CommandRegistry.register("feetech-set-id")
@@ -52,7 +48,7 @@ class SetIdCommand(BaseCommand):
     def handle(self, cfg) -> None:
         args = self._parse_args()
 
-        port = args.port or self._prompt_for_port()
+        port = args.port or prompt_for_port()
         if port is None:
             print("No port selected. Aborting.")
             return
@@ -63,7 +59,7 @@ class SetIdCommand(BaseCommand):
         bus._connect(handshake=False)
         try:
             while True:
-                found = self._scan(bus, only_baudrate=args.baudrate)
+                found = scan_motors(bus, only_baudrate=args.baudrate)
                 if not found:
                     print(
                         "\nNo motors responded on this port.\n"
@@ -81,7 +77,7 @@ class SetIdCommand(BaseCommand):
                     break
 
                 baudrate, motor_id, model_nb = target
-                model = _MODEL_NB_TO_NAME.get(model_nb)
+                model = MODEL_NB_TO_NAME.get(model_nb)
                 if model is None:
                     print(
                         f"Motor at ID {motor_id} reports unknown model number {model_nb}; "
@@ -148,90 +144,12 @@ class SetIdCommand(BaseCommand):
         args, _ = parser.parse_known_args(sys.argv[2:])
         return args
 
-    def _prompt_for_port(self) -> str | None:
-        ports = list(serial.tools.list_ports.comports())
-        if not ports:
-            print("No serial ports detected.")
-            return None
-
-        print("\n=== Available Ports ===")
-        for idx, p in enumerate(ports, 1):
-            print(f"{idx}. {p.device} ({p.description})")
-
-        raw = input(f"Select a port (1-{len(ports)}), or type a path: ").strip()
-        if raw.isdigit():
-            idx = int(raw)
-            if 1 <= idx <= len(ports):
-                return ports[idx - 1].device
-            print("Invalid selection.")
-            return None
-        return raw or None
-
-    # --------------------------------------------------------------- scanning
-
-    #: Highest motor ID probed during the unicast sweep. Kept small because each
-    #: missing ID costs a full packet timeout (~50 ms); robot chains use low IDs.
-    _SWEEP_MAX_ID = 30
-
-    def _baudrates_to_scan(self, bus: FeetechMotorsBus, only_baudrate: int | None) -> list[int]:
-        if only_baudrate:
-            return [only_baudrate]
-        # Try the default (by far most common) baud-rate first so the usual case
-        # finishes in one pass instead of walking all 11 rates.
-        rest = [b for b in bus.available_baudrates if b != bus.default_baudrate]
-        return [bus.default_baudrate, *rest]
-
-    def _scan(self, bus: FeetechMotorsBus, only_baudrate: int | None = None):
-        """Return ``{baudrate: {id: model_number}}`` for responding motors.
-
-        A broadcast ping is fast but can silently miss motors whose
-        ``Return_Delay_Time`` is large (the factory default), so we confirm with
-        a short per-ID unicast sweep on the active baud-rate. Motors always share
-        a single baud-rate, so we stop at the first rate that responds.
-        """
-        baudrates = self._baudrates_to_scan(bus, only_baudrate)
-        print("\nScanning bus...")
-        found: dict[int, dict[int, int]] = {}
-        for baudrate in baudrates:
-            bus.set_baudrate(baudrate)
-            motors = dict(bus.broadcast_ping(num_retry=1) or {})
-            if motors:
-                # Catch any motors the broadcast missed, then stop: the whole
-                # chain lives on this one baud-rate.
-                motors.update(self._unicast_sweep(bus, skip=set(motors)))
-                found[baudrate] = motors
-                break
-
-        # Fallback: nothing answered a broadcast anywhere. Do a per-ID sweep on
-        # each rate (still bounded to the low ID range) until something responds.
-        if not found:
-            print("Broadcast ping found nothing; falling back to per-ID scan...")
-            for baudrate in baudrates:
-                bus.set_baudrate(baudrate)
-                motors = self._unicast_sweep(bus, skip=set())
-                if motors:
-                    found[baudrate] = motors
-                    break
-
-        return found
-
-    def _unicast_sweep(self, bus: FeetechMotorsBus, skip: set[int]) -> dict[int, int]:
-        """Ping IDs individually (low range only) and return ``{id: model_number}``."""
-        motors: dict[int, int] = {}
-        for motor_id in range(self._SWEEP_MAX_ID + 1):
-            if motor_id in skip:
-                continue
-            model_nb = bus.ping(motor_id)
-            if model_nb is not None:
-                motors[motor_id] = model_nb
-        return motors
-
     def _print_found(self, found: dict[int, dict[int, int]]) -> None:
         print("\n=== Motors Found ===")
         for baudrate in sorted(found):
             for motor_id in sorted(found[baudrate]):
                 model_nb = found[baudrate][motor_id]
-                model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+                model = MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
                 print(f"  baudrate={baudrate:>8}  id={motor_id:<3}  model={model}")
 
     def _select_target(self, found: dict[int, dict[int, int]]):
@@ -249,7 +167,7 @@ class SetIdCommand(BaseCommand):
         id1 = [c for c in candidates if c[1] == 1]
         if len(id1) == 1:
             baudrate, motor_id, model_nb = id1[0]
-            model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+            model = MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
             if self._ask_yes_no(
                 f"Target the newly-added motor at ID 1 (baudrate={baudrate}, {model})?",
                 default=True,
@@ -263,7 +181,7 @@ class SetIdCommand(BaseCommand):
 
         print("\n=== Select Motor ===")
         for idx, (baudrate, motor_id, model_nb) in enumerate(candidates, 1):
-            model = _MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
+            model = MODEL_NB_TO_NAME.get(model_nb, f"unknown({model_nb})")
             print(f"{idx}. baudrate={baudrate} id={motor_id} model={model}")
         raw = input(f"Motor number (1-{len(candidates)}), or Enter to stop: ").strip()
         if not raw:

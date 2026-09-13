@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import time
 from copy import deepcopy
 from enum import Enum
 from pprint import pformat
@@ -96,6 +97,24 @@ def patch_setPacketTimeout(self, packet_length):  # noqa: N802
     self.packet_timeout = (self.tx_time_per_byte * packet_length) + (self.tx_time_per_byte * 3.0) + 50
 
 
+def patch_clearPort(self):  # noqa: N802
+    """Drain RX. scservo_sdk's clearPort calls ser.flush(), which only waits for TX.
+
+    Leftover status bytes from a previous motor — especially a different model
+    or firmware on the same daisy chain — make the next ping look like a missing
+    motor.
+    """
+    if self.ser is not None:
+        self.ser.reset_input_buffer()
+
+
+#: Unicast pings during handshake. Mixed STS3215/STS3250 (and mixed firmware)
+#: drop the first try more often than a homogeneous chain.
+_HANDSHAKE_PING_RETRIES = 5
+# USB ACM can still deliver a previous model's packet after reset_input_buffer.
+_MIXED_MODEL_SETTLE_S = 0.02
+
+
 class FeetechMotorsBus(MotorsBus):
     """
     The FeetechMotorsBus class allows to efficiently read and write to the attached motors. It relies on the
@@ -130,6 +149,7 @@ class FeetechMotorsBus(MotorsBus):
         self.port_handler.setPacketTimeout = patch_setPacketTimeout.__get__(
             self.port_handler, scs.PortHandler
         )
+        self.port_handler.clearPort = patch_clearPort.__get__(self.port_handler, scs.PortHandler)
         self.packet_handler = scs.PacketHandler(protocol_version)
         self.sync_reader = scs.GroupSyncRead(self.port_handler, self.packet_handler, 0, 0)
         self.sync_writer = scs.GroupSyncWrite(self.port_handler, self.packet_handler, 0, 0)
@@ -154,7 +174,11 @@ class FeetechMotorsBus(MotorsBus):
             )
 
     def _assert_same_firmware(self) -> None:
-        firmware_versions = self._read_firmware_version(self.ids, raise_on_error=True)
+        # raise_on_error=False: a mixed-model chain can fail a firmware register
+        # read even after the motor pinged; that must not abort connect.
+        firmware_versions = self._read_firmware_version(self.ids, raise_on_error=False)
+        if len(firmware_versions) < 2:
+            return
         if len(set(firmware_versions.values())) != 1:
             # Minor firmware differences (e.g. 3.9 vs 3.10) across otherwise
             # identical servos are common and work fine in practice, so this is
@@ -170,6 +194,76 @@ class FeetechMotorsBus(MotorsBus):
     def _handshake(self) -> None:
         self._assert_motors_exist()
         self._assert_same_firmware()
+
+    def _assert_motors_exist(self) -> None:
+        """Ping expected IDs in ID order, the same sweep ``feetech-set-id`` uses.
+
+        Mixed STS3215/STS3250 daisy chains do not answer a 3215 as the first
+        packet on a freshly opened port — leftover 3250 timing is not the
+        whole story. Talking to the 3250s first (low IDs) is what actually
+        finds the 3215. When expected IDs are missing, also probe nearby IDs
+        so an off-by-one assignment (e.g. ID 7 instead of 6) shows up.
+        """
+        expected_models = {m.id: self.model_number_table[m.model] for m in self.motors.values()}
+        found_models: dict[int, int] = {}
+        extra_models: dict[int, int] = {}
+
+        for id_ in sorted(self.ids):
+            model_nb = self.ping(id_, num_retry=_HANDSHAKE_PING_RETRIES)
+            if model_nb is not None:
+                found_models[id_] = model_nb
+
+        missing_ids = [id_ for id_ in self.ids if id_ not in found_models]
+        if missing_ids:
+            self.port_handler.clearPort()
+            time.sleep(_MIXED_MODEL_SETTLE_S)
+            hi = max(self.ids) + 8
+            for id_ in range(1, hi + 1):
+                if id_ in found_models or id_ in extra_models:
+                    continue
+                model_nb = self.ping(id_, num_retry=2)
+                if model_nb is None:
+                    continue
+                if id_ in expected_models:
+                    found_models[id_] = model_nb
+                else:
+                    extra_models[id_] = model_nb
+
+        missing_ids = [id_ for id_ in self.ids if id_ not in found_models]
+        wrong_models = {
+            id_: (expected_models[id_], found_models[id_])
+            for id_ in found_models
+            if expected_models.get(id_) != found_models[id_]
+        }
+
+        if missing_ids or wrong_models:
+            error_lines = [f"{self.__class__.__name__} motor check failed on port '{self.port}':"]
+
+            if missing_ids:
+                error_lines.append("\nMissing motor IDs:")
+                error_lines.extend(
+                    f"  - {id_} (expected model: {expected_models[id_]})" for id_ in missing_ids
+                )
+
+            if wrong_models:
+                error_lines.append("\nMotors with incorrect model numbers:")
+                error_lines.extend(
+                    f"  - {id_} ({self._id_to_name(id_)}): expected {expected}, found {found}"
+                    for id_, (expected, found) in wrong_models.items()
+                )
+
+            if extra_models:
+                error_lines.append("\nUnexpected IDs also on this bus (not in the module config):")
+                error_lines.extend(
+                    f"  - {id_} (model number: {model_nb})" for id_, model_nb in sorted(extra_models.items())
+                )
+
+            error_lines.append("\nFull expected motor list (id: model_number):")
+            error_lines.append(pformat(expected_models, indent=4, sort_dicts=False))
+            error_lines.append("\nFull found motor list (id: model_number):")
+            error_lines.append(pformat(found_models, indent=4, sort_dicts=False))
+
+            raise RuntimeError("\n".join(error_lines))
 
     def _find_single_motor(self, motor: str, initial_baudrate: int | None = None) -> tuple[int, int]:
         if self.protocol_version == 0:
@@ -427,9 +521,50 @@ class FeetechMotorsBus(MotorsBus):
 
         return self._read_model_number(list(ids_status), raise_on_error)
 
+    def ping(self, motor: NameOrID, num_retry: int = 0, raise_on_error: bool = False) -> int | None:
+        """Ping one motor, flushing RX first so a mixed-model chain can reply.
+
+        The SDK ``ping()`` issues INST_PING and then reads Model_Number without
+        draining leftover bytes in between. On a daisy chain of mixed models /
+        firmware that second packet is what fails, so the motor looks missing.
+        Status flags on an otherwise valid reply are ignored (the motor is there).
+        """
+        import scservo_sdk as scs
+
+        id_ = self._get_motor_id(motor)
+        last_comm = None
+        last_error = 0
+        for n_try in range(1 + num_retry):
+            self.port_handler.clearPort()
+            txpacket = [0] * 6
+            txpacket[scs.PKT_ID] = id_
+            txpacket[scs.PKT_LENGTH] = 2
+            txpacket[scs.PKT_INSTRUCTION] = scs.INST_PING
+            _, comm, error = self.packet_handler.txRxPacket(self.port_handler, txpacket)
+            last_comm, last_error = comm, error
+            if not self._is_comm_success(comm):
+                logger.debug("ping failed for %s: n_try=%s comm=%s error=%s", id_, n_try, comm, error)
+                continue
+
+            self.port_handler.clearPort()
+            model_nb, comm, error = self._read(*MODEL_NUMBER, id_, raise_on_error=False)
+            last_comm, last_error = comm, error
+            if self._is_comm_success(comm) and model_nb:
+                return model_nb
+            logger.debug(
+                "model-number read failed for %s: n_try=%s comm=%s error=%s", id_, n_try, comm, error
+            )
+
+        if raise_on_error:
+            if last_comm is not None and not self._is_comm_success(last_comm):
+                raise ConnectionError(self.packet_handler.getTxRxResult(last_comm))
+            raise RuntimeError(self.packet_handler.getRxPacketError(last_error))
+        return None
+
     def _read_firmware_version(self, motor_ids: list[int], raise_on_error: bool = False) -> dict[int, str]:
         firmware_versions = {}
         for id_ in motor_ids:
+            self.port_handler.clearPort()
             firm_ver_major, comm, error = self._read(
                 *FIRMWARE_MAJOR_VERSION, id_, raise_on_error=raise_on_error
             )
@@ -449,8 +584,9 @@ class FeetechMotorsBus(MotorsBus):
     def _read_model_number(self, motor_ids: list[int], raise_on_error: bool = False) -> dict[int, int]:
         model_numbers = {}
         for id_ in motor_ids:
+            self.port_handler.clearPort()
             model_nb, comm, error = self._read(*MODEL_NUMBER, id_, raise_on_error=raise_on_error)
-            if not self._is_comm_success(comm) or self._is_error(error):
+            if not self._is_comm_success(comm) or not model_nb:
                 continue
 
             model_numbers[id_] = model_nb

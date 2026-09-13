@@ -208,6 +208,10 @@ class FeetechBus(ActuatorBus):
         except Exception:
             return None
 
+    def center_offset_in_hardware(self, name: str) -> bool:
+        del name
+        return True
+
     def max_homing_offset_abs(self, name: str) -> int | None:
         """Max ``|Homing_Offset|`` for Feetech STS/SMS (sign bit 11 → ±2047)."""
         from .lerobot.feetech.tables import MODEL_ENCODING_TABLE

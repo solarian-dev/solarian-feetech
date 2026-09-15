@@ -208,8 +208,8 @@ MODEL_BAUDRATE_TABLE = {
 # Goal position decoding, values wrap to ~32k when the encoder crosses 0 after
 # a Homing_Offset shift -- see huggingface/lerobot#2223.
 #
-# Homing_Offset max magnitude is (1 << sign_bit) - 1 = 2047; exposed to core
-# calibration via FeetechBus.max_homing_offset_abs.
+# Homing_Offset max magnitude is (1 << sign_bit) - 1 = 2047. Solarian keeps
+# that register at 0 and applies center_offset in software (CPR-1 cap).
 STS_SMS_SERIES_ENCODINGS_TABLE = {
     "Homing_Offset": 11,
     "Goal_Position": 15,

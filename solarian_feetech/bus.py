@@ -7,9 +7,11 @@ Bus implementation for communicating with Feetech servos.
 import logging
 from typing import Dict, Any
 
+import serial.tools.list_ports
+
 from solarian.core.data import PosData, SpeedData, TorqueEnableData, Data, TemperatureData
+from . import provision
 from .lerobot.feetech import FeetechMotorsBus
-from .lerobot.feetech.feetech import NORMALIZED_DATA
 from solarian.core.calibration import Motor, MotorCalibration, MotorNormMode
 
 from solarian.core.component import Component
@@ -169,32 +171,44 @@ class FeetechBus(ActuatorBus):
 
     def connect(self):
         self.bus.connect()
-        
+        # Software center_offset is the only wrap shift. A leftover EEPROM
+        # Homing_Offset (from older calibrations) would double-apply and send
+        # hold-present / 0 cm to the wrong end of travel.
+        names = list(self.components.keys())
+        self.bus.disable_torque(names)
+        for name in names:
+            self._write_open_hardware_limits(name)
+
     def disconnect(self):
         if self.bus.is_connected:
             self.bus.disconnect()
 
     def read(self, data_type: type[Data], component_names: list[str], normalize: bool = True):
-        return grouped_sync_read(
+        raw = grouped_sync_read(
             self.bus,
             map_read(data_type),
             component_names,
-            normalize=normalize,
+            normalize=False,
             max_group=self._SYNC_READ_MAX_GROUP,
         )
+        if normalize and data_type is PosData:
+            return self._normalize({name: float(val) for name, val in raw.items()})
+        return raw
 
     def write(self, values: Dict[str, Data], normalize: bool = True):
-        # group values by class type, extracting raw values from Data objects
-        values_by_class = {}
+        values_by_class: dict[type[Data], dict[str, Any]] = {}
         for name, value in values.items():
-            if value.__class__ not in values_by_class:
-                values_by_class[value.__class__] = {}
-            values_by_class[value.__class__][name] = value.value
+            values_by_class.setdefault(value.__class__, {})[name] = value.value
         for class_type, class_values in values_by_class.items():
             data_name = map_write(class_type)
-            if not normalize or data_name not in NORMALIZED_DATA:
-                class_values = {k: int(v) for k, v in class_values.items()}
-            self.bus.sync_write(data_name, values=class_values, normalize=normalize)
+            if normalize and class_type is PosData:
+                class_values = {
+                    name: int(round(val))
+                    for name, val in self._unnormalize(class_values).items()
+                }
+            else:
+                class_values = {name: int(val) for name, val in class_values.items()}
+            self.bus.sync_write(data_name, values=class_values, normalize=False)
 
     def counts_per_revolution(self, name: str) -> int | None:
         """Encoder resolution (counts/rev) for motor ``name`` from its model.
@@ -210,10 +224,14 @@ class FeetechBus(ActuatorBus):
 
     def center_offset_in_hardware(self, name: str) -> bool:
         del name
-        return True
+        return False
 
     def max_homing_offset_abs(self, name: str) -> int | None:
-        """Max ``|Homing_Offset|`` for Feetech STS/SMS (sign bit 11 → ±2047)."""
+        """Hardware ``Homing_Offset`` register cap (STS/SMS sign bit 11 → ±2047).
+
+        Unused while :meth:`center_offset_in_hardware` is False; software
+        ``center_offset`` is capped at CPR-1 instead.
+        """
         from .lerobot.feetech.tables import MODEL_ENCODING_TABLE
 
         try:
@@ -226,20 +244,79 @@ class FeetechBus(ActuatorBus):
             return None
 
     def is_calibrated(self) -> bool:
-        return self.bus.is_calibrated
+        if not self.calibration:
+            return False
+        return all(name in self.calibration for name in self.components)
 
     def reset_calibration(self, component_names: list[str]):
-        self.bus.reset_calibration(component_names)
+        if self.calibration is None:
+            self.calibration = {}
+        for name in component_names:
+            self._write_open_hardware_limits(name)
+            cfg = self.components[name].cfg
+            cpr = self.counts_per_revolution(name) or 4096
+            self.calibration[name] = MotorCalibration(
+                id=int(cfg.id) if cfg is not None else 0,
+                drive_mode=0,
+                homing_offset=0,
+                range_min=0,
+                range_max=cpr - 1,
+            )
+        self.bus.calibration = dict(self.calibration)
 
     def read_calibration(self) -> dict[str, MotorCalibration]:
-        return self.bus.read_calibration()
-        
+        return dict(self.calibration or {})
+
+    def _write_open_hardware_limits(self, name: str) -> None:
+        """Homing_Offset=0 and full encoder travel, so software owns the wrap shift.
+
+        A leftover EEPROM Homing_Offset (from older calibrations) would double-apply
+        on top of ``center_offset`` and send hold-present / 0 cm to the wrong end of
+        travel, so the write is read back.
+        """
+        motor = self.bus.motors[name]
+        provision.open_position_registers(self.bus, motor.model, motor.id)
+
+    def drive_to_encoder_center(self, component_names: list[str]) -> Dict[str, int]:
+        reached: Dict[str, int] = {}
+        for name in component_names:
+            motor = self.bus.motors[name]
+            half = ((self.counts_per_revolution(name) or 4096) - 1) // 2
+            present = provision.move_to_mid_encoder(self.bus, motor.model, motor.id)
+            reached[name] = present
+            if abs(present - half) > 8:
+                logger.warning(
+                    "%s: reached %d, wanted ~%d. Shaft may be blocked.", name, present, half
+                )
+        return reached
+
+    # -- provisioning (no declared components: servos are addressed by ID) --
+    @classmethod
+    def available_ports(cls) -> list[str]:
+        return [p.device for p in serial.tools.list_ports.comports()]
+
+    @classmethod
+    def scan_port(cls, port: str) -> list[dict]:
+        return provision.scan(port)
+
+    @classmethod
+    def provision_servo(cls, port: str, found: dict) -> None:
+        bus = provision.open_bus(port)
+        try:
+            provision.provision(bus, int(found["baudrate"]), int(found["id"]), str(found["model"]))
+        finally:
+            provision.close_bus(bus)
+
     def write_calibration(self, calibration_dict: dict[str, MotorCalibration]) -> dict[str, MotorCalibration]:
-        # bound min and max to range of motion
+        if self.calibration is None:
+            self.calibration = {}
         for name, calibration in calibration_dict.items():
-            calibration.range_min = max(calibration.range_min, 0)
-            calibration.range_max = min(calibration.range_max, 4095)
-        self.bus.write_calibration(calibration_dict)
+            cpr = self.counts_per_revolution(name) or 4096
+            calibration.range_min = max(int(calibration.range_min), 0)
+            calibration.range_max = min(int(calibration.range_max), cpr - 1)
+            self.calibration[name] = calibration
+            self._write_open_hardware_limits(name)
+        self.bus.calibration = dict(self.calibration)
         return calibration_dict
 
     def configure(self, params: dict[str, int], component_names: list[str]):
@@ -268,15 +345,14 @@ class FeetechBus(ActuatorBus):
         pass
         
     def set_half_turn_homings(self, component_names: list[str]) -> Dict[str, int]:
-        """Set half turn homings for the actuators. Read present position and set/store.
+        """Software ``center_offset`` so the current pose reads mid-encoder.
 
-        Reimplements the base helper so the position read is resilient: Feetech
-        group sync reads get corrupted once too many motors (or mixed models)
-        share one frame. The vendored ``set_half_turn_homings`` reads every motor
-        in a single no-retry sync read, so a single bad frame aborts calibration.
-        Here we reuse the chunked, retrying read path used at run time.
+        Hardware Homing_Offset stays 0. Feetech group sync reads get corrupted
+        once too many motors (or mixed models) share one frame, so this uses
+        the chunked, retrying read path instead of the vendored no-retry helper.
         """
-        self.bus.reset_calibration(component_names)
+        for name in component_names:
+            self._write_open_hardware_limits(name)
 
         positions = grouped_sync_read(
             self.bus,
@@ -286,9 +362,28 @@ class FeetechBus(ActuatorBus):
             max_group=self._SYNC_READ_MAX_GROUP,
         )
 
-        homing_offsets = self.bus._get_half_turn_homings(positions)
-        for motor, offset in homing_offsets.items():
-            self.bus.write("Homing_Offset", motor, offset)
+        if self.calibration is None:
+            self.calibration = {}
+        homing_offsets: Dict[str, int] = {}
+        for name in component_names:
+            raw = int(positions[name])
+            cpr = self.counts_per_revolution(name) or 4096
+            offset = raw - ((cpr - 1) // 2)
+            entry = self.calibration.get(name)
+            if entry is None:
+                cfg = self.components[name].cfg
+                entry = MotorCalibration(
+                    id=int(cfg.id) if cfg is not None else 0,
+                    drive_mode=0,
+                    homing_offset=offset,
+                    range_min=0,
+                    range_max=cpr - 1,
+                )
+                self.calibration[name] = entry
+            else:
+                entry.homing_offset = offset
+            homing_offsets[name] = offset
+        self.bus.calibration = dict(self.calibration)
         return homing_offsets
 
     def setup_component(self, component_name: str, configs: Dict[str, Any]):

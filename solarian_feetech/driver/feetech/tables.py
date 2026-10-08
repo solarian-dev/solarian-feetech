@@ -206,7 +206,7 @@ MODEL_BAUDRATE_TABLE = {
 # Sign-Magnitude encoding bits (must match Feetech SMS/STS SDK: position and
 # speed use sign bit 15; Homing_Offset uses sign bit 11). Without Present /
 # Goal position decoding, values wrap to ~32k when the encoder crosses 0 after
-# a Homing_Offset shift -- see huggingface/lerobot#2223.
+# a Homing_Offset shift.
 #
 # Homing_Offset max magnitude is (1 << sign_bit) - 1 = 2047. Solarian keeps
 # that register at 0 and applies center_offset in software (CPR-1 cap).

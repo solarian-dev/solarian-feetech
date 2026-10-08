@@ -2,8 +2,8 @@
 
 import serial.tools.list_ports
 
-from .lerobot.feetech import FeetechMotorsBus
-from .lerobot.feetech.tables import MODEL_NUMBER_TABLE
+from .driver.feetech import FeetechMotorsBus
+from .driver.feetech.tables import MODEL_NUMBER_TABLE
 
 MODEL_NB_TO_NAME = {nb: name for name, nb in MODEL_NUMBER_TABLE.items()}
 

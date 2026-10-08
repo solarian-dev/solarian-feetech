@@ -14,15 +14,15 @@ from __future__ import annotations
 
 import time
 
-from .lerobot.common.utils.encoding_utils import decode_sign_magnitude, encode_sign_magnitude
-from .lerobot.feetech import FeetechMotorsBus, OperatingMode, TorqueMode
-from .lerobot.feetech.tables import (
+from .driver.common.utils.encoding_utils import decode_sign_magnitude, encode_sign_magnitude
+from .driver.feetech import FeetechMotorsBus, OperatingMode, TorqueMode
+from .driver.feetech.tables import (
     MODEL_BAUDRATE_TABLE,
     MODEL_ENCODING_TABLE,
     MODEL_NUMBER_TABLE,
     MODEL_RESOLUTION,
 )
-from .lerobot.motors_bus import get_address
+from .driver.motors_bus import get_address
 from .scan import MODEL_NB_TO_NAME, scan_motors
 
 

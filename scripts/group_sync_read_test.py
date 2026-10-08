@@ -28,8 +28,8 @@ import serial.tools.list_ports
 
 from solarian.core.calibration import Motor, MotorNormMode
 from solarian_feetech.bus import SYNC_READ_MAX_GROUP, chunk_by_model, grouped_sync_read
-from solarian_feetech.lerobot.feetech import FeetechMotorsBus
-from solarian_feetech.lerobot.feetech.tables import MODEL_NUMBER_TABLE
+from solarian_feetech.driver.feetech import FeetechMotorsBus
+from solarian_feetech.driver.feetech.tables import MODEL_NUMBER_TABLE
 
 #: model number reported by a motor -> model name understood by the SDK
 _MODEL_NB_TO_NAME = {nb: name for name, nb in MODEL_NUMBER_TABLE.items()}

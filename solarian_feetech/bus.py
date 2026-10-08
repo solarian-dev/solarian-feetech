@@ -11,7 +11,7 @@ import serial.tools.list_ports
 
 from solarian.core.data import PosData, SpeedData, TorqueEnableData, Data, TemperatureData
 from . import provision
-from .lerobot.feetech import FeetechMotorsBus
+from .driver.feetech import FeetechMotorsBus
 from solarian.core.calibration import Motor, MotorCalibration, MotorNormMode
 
 from solarian.core.component import Component
@@ -232,7 +232,7 @@ class FeetechBus(ActuatorBus):
         Unused while :meth:`center_offset_in_hardware` is False; software
         ``center_offset`` is capped at CPR-1 instead.
         """
-        from .lerobot.feetech.tables import MODEL_ENCODING_TABLE
+        from .driver.feetech.tables import MODEL_ENCODING_TABLE
 
         try:
             model = self.bus.motors[name].model

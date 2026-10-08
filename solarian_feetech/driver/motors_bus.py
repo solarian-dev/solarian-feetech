@@ -20,7 +20,9 @@
 # https://github.com/astral-sh/ruff/issues/3711
 
 import abc
+import glob
 import logging
+import os
 from contextlib import contextmanager
 from functools import cached_property
 from pprint import pformat
@@ -198,15 +200,7 @@ class MotorsBus(abc.ABC):
     Note: This class may evolve in the future should we add support for other types of bus.
 
     A MotorsBus subclass instance requires a port (e.g. `FeetechMotorsBus(port="/dev/tty.usbmodem575E0031751"`)).
-    To find the port, you can run our utility script:
-    ```bash
-    python -m lerobot.find_port.py
-    >>> Finding all available ports for the MotorsBus.
-    >>> ['/dev/tty.usbmodem575E0032081', '/dev/tty.usbmodem575E0031751']
-    >>> Remove the usb cable from your MotorsBus and press Enter when done.
-    >>> The port of this MotorsBus is /dev/tty.usbmodem575E0031751.
-    >>> Reconnect the usb cable.
-    ```
+    On Linux, prefer the stable `/dev/serial/by-id/...` path over `/dev/ttyACM*`.
 
     Example of usage for 1 Feetech sts3215 motor connected to the bus:
     ```python
@@ -422,10 +416,14 @@ class MotorsBus(abc.ABC):
             elif handshake:
                 self._handshake()
         except (FileNotFoundError, OSError, serial.SerialException) as e:
-            raise ConnectionError(
-                f"\nCould not connect on port '{self.port}'. Make sure you are using the correct port."
-                "\nTry running `python lerobot/find_port.py`\n"
-            ) from e
+            if not os.path.exists(self.port):
+                present = sorted(glob.glob("/dev/serial/by-id/*") or glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+                raise ConnectionError(
+                    f"\nPort '{self.port}' does not exist: the servo controller's USB serial device is not enumerated."
+                    f"\nSerial devices present: {present or 'none'}."
+                    "\nCheck `dmesg | tail` for USB errors such as 'error -71' or 'unable to enumerate USB device'.\n"
+                ) from e
+            raise ConnectionError(f"\nCould not connect on port '{self.port}'.\n") from e
 
     @abc.abstractmethod
     def _handshake(self) -> None:

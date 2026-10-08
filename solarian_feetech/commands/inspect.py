@@ -11,14 +11,35 @@ import sys
 
 from solarian.cli import BaseCommand, CommandRegistry
 
-from ..lerobot.feetech import FeetechMotorsBus
-from ..lerobot.motors_bus import get_address
+from ..driver.feetech import FeetechMotorsBus
+from ..driver.motors_bus import get_address
 from ..scan import MODEL_NB_TO_NAME, prompt_for_port, scan_motors
 
 
 @CommandRegistry.register("feetech-inspect")
 class InspectCommand(BaseCommand):
     help = "Scan a Feetech bus and print each motor's model and firmware version."
+    category = "Robot"
+    uses_config = False
+    description = """
+    Prints one row per motor that answered: id, model, firmware version and
+    Return_Delay_Time. Use it to diagnose a daisy chain that mixes models or
+    firmware, which is where grouped sync reads and comms timing start to matter.
+
+    Read-only. Feetech's bootloader protocol is unpublished, so matching firmware
+    still needs the official Windows FD tool.
+    """
+    usage = "[--port PORT] [--baudrate BAUDRATE]"
+    options = {
+        "--port PORT": "Serial port of the bus (e.g. /dev/ttyACM0). Prompted if "
+                       "omitted.",
+        "--baudrate BAUDRATE": "Only scan this baud rate, which is faster. Otherwise "
+                               "every supported rate is scanned.",
+    }
+    examples = (
+        "solarian feetech-inspect",
+        "solarian feetech-inspect --port /dev/ttyACM0",
+    )
 
     def handle(self, cfg) -> None:
         args = self._parse_args()

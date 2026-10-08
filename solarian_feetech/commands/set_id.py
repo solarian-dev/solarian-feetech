@@ -40,6 +40,37 @@ from ..scan import MODEL_NB_TO_NAME, prompt_for_port, scan_motors
 @CommandRegistry.register("feetech-set-id")
 class SetIdCommand(BaseCommand):
     help = "Scan a Feetech bus, apply recommended comms settings, and assign a motor ID."
+    category = "Robot"
+    uses_config = False
+    description = """
+    Provisions a daisy chain without unplugging anything:
+
+      1. Scan the bus across every supported baud rate and list what answered
+      2. Target a motor, by default the one still at the factory ID 1
+      3. Apply the recommended comms settings (Return_Delay_Time = 0)
+      4. Optionally write a new ID
+      5. Optionally drive the shaft to mid-encoder, so the horn can be mounted at
+         the mechanism's mid-travel and joint travel stays off the 0/CPR wrap
+      6. Repeat for the next motor
+
+    Every configured motor has a unique ID, so the one you just added is the only
+    one still at ID 1 and can be reassigned safely while the chain stays live.
+    Connect one new motor at a time: fresh motors all answer at ID 1 and collide.
+
+    Re-run it and decline the ID change to only fix comms settings.
+    `solarian calibrate-servo` does the same for any brand.
+    """
+    usage = "[--port PORT] [--baudrate BAUDRATE]"
+    options = {
+        "--port PORT": "Serial port of the bus (e.g. /dev/ttyUSB0). Prompted if "
+                       "omitted.",
+        "--baudrate BAUDRATE": "Only scan this baud rate, which is faster. Otherwise "
+                               "every supported rate is scanned.",
+    }
+    examples = (
+        "solarian feetech-set-id",
+        "solarian feetech-set-id --port /dev/ttyUSB0 --baudrate 1000000",
+    )
 
     def handle(self, cfg) -> None:
         args = self._parse_args()

@@ -9,6 +9,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "solarian>=0.1.0",
+    "pyserial>=3.5",
+    "deepdiff",
+]
+
+[project.optional-dependencies]
+# Only the machine wired to the servos needs the vendor SDK: the driver imports
+# scservo_sdk inside the methods that talk to the bus, so the module classes
+# (and the robot schema built from them) import without it.
+hardware = [
     "feetech-servo-sdk>=1.0.0",
 ]
 

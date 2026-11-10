@@ -1,0 +1,13 @@
+Solarian Feetech plugin
+Copyright 2026 PrimaryKey Inc.
+
+This product includes software developed by PrimaryKey Inc.
+
+
+Third-party code
+================
+
+solarian_feetech/driver/
+  Derived from LeRobot (https://github.com/huggingface/lerobot),
+  Copyright 2024 The HuggingFace Inc. team, Apache License 2.0, and
+  modified.

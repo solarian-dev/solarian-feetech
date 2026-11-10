@@ -49,3 +49,9 @@ The `FeetechBus` is automatically used for communication - no configuration need
 This plugin should be maintained in its own repository:
 - GitHub: `https://github.com/yourorg/solarian-feetech`
 - Can be published to PyPI for easy installation
+
+## License
+
+[Apache License 2.0](LICENSE). Copyright 2026 PrimaryKey Inc. The driver in `solarian_feetech/driver/` is derived from [LeRobot](https://github.com/huggingface/lerobot) (Apache 2.0); see [NOTICE](NOTICE).
+
+Solarian and the Solarian logo are trademarks of PrimaryKey Inc. See the [trademark policy](https://github.com/solarian-dev/solarian/blob/main/TRADEMARKS.md).
